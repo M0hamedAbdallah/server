@@ -4,6 +4,7 @@ import os
 import shutil
 
 from flask import Flask, jsonify, request
+from werkzeug.exceptions import HTTPException
 
 from config import (
     DOWNLOAD_TIMEOUT_SECONDS,
@@ -50,6 +51,16 @@ def _iter_file(path, directory):
         _cleanup_temp_dir(directory)
 
 
+@app.get("/")
+def health():
+    """Public health endpoint used by Render probes (HEAD / and GET /).
+
+    No authentication, no yt-dlp, and no network calls. Flask answers HEAD
+    automatically for this GET route with status 200 and an empty body.
+    """
+    return jsonify({"status": "ok"})
+
+
 @app.get("/download")
 def download_media():
     if _request_token() != TOKEN:
@@ -82,6 +93,13 @@ def download_media():
     response.headers["Content-Disposition"] = disposition
     response.headers["Content-Length"] = str(result["size"])
     return response
+
+
+@app.errorhandler(HTTPException)
+def handle_http_error(exc):  # noqa: ARG001 - normal HTTP statuses stay intact
+    # الأخطاء العادية من التوجيه (مثل مسار غير معروف 404، طريقة غير مسموحة 405)
+    # تُحتفظ برموز حالتها الصحيحة دون تسجيل أثر مكدّس.
+    return jsonify({"error": exc.description}), exc.code
 
 
 @app.errorhandler(Exception)
