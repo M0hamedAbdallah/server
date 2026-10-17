@@ -5,6 +5,7 @@ downloader (kill + join) instead of merely abandoning a thread while yt-dlp
 keeps running against a removed temp directory.
 """
 
+import json
 import mimetypes
 import os
 import shutil
@@ -14,10 +15,11 @@ import tempfile
 from subprocess import TimeoutExpired
 
 try:
-    import yt_dlp  # noqa: F401  (ensures yt-dlp is importable)
+    from yt_dlp import YoutubeDL  # noqa: F401  (ensures yt-dlp is importable)
     YT_DLP_AVAILABLE = True
 except Exception:  # pragma: no cover - yt-dlp may be absent in test envs
     YT_DLP_AVAILABLE = False
+    YoutubeDL = None  # type: ignore[assignment]
 
 
 class DownloadError(Exception):
@@ -110,3 +112,95 @@ def download(url, *, temp_dir=None, timeout=None, max_file_size=None):
 
     mime, _ = mimetypes.guess_type(file_path)
     return {"path": file_path, "name": files[0], "mime": mime, "size": size}
+
+
+def extract_playlist(url, *, timeout=None, max_entries=50):
+    """Extract ordered metadata of a public YouTube playlist without downloading videos.
+
+    Uses yt-dlp CLI flat extraction (no shell, no per-video network fetches beyond
+    the playlist page). The subprocess is killed and waited on when the timeout
+    elapses, so no extractor keeps running after a deadline.
+    Returns {"playlist_id", "title", "count", "entries"} where
+    each entry is {"id", "title", "url"}. Raises DownloadError on failure.
+    """
+    if not YT_DLP_AVAILABLE:
+        raise DownloadError("yt-dlp غير مثبت على الخادم")
+
+    overall_timeout = min(max(int(timeout or 120), 1), 300)
+    max_entries = max(1, min(int(max_entries or 50), 200))
+
+    args = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--quiet",
+        "--no-warnings",
+        "--flat-playlist",
+        "--dump-json",
+        "--playlist-items",
+        f"1:{max_entries}",
+        "--socket-timeout",
+        str(min(overall_timeout, 300)),
+        url,
+    ]
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = proc.communicate(timeout=overall_timeout)
+        except TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise DownloadError("انتهت مهلة جلب قائمة التشغيل") from None
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    if proc.returncode not in (None, 0):
+        raise DownloadError("فشل جلب قائمة التشغيل من المنصة")
+
+    entries = []
+    playlist_id = ""
+    playlist_title = "قائمة تشغيل"
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or not entry.get("id") or not entry.get("title"):
+            continue
+        if not playlist_id and entry.get("playlist_id"):
+            playlist_id = str(entry["playlist_id"])
+        if playlist_title == "قائمة تشغيل" and entry.get("playlist_title"):
+            playlist_title = str(entry["playlist_title"])
+        entries.append(
+            {
+                "id": str(entry["id"]),
+                "title": str(entry["title"]),
+                "url": "https://www.youtube.com/watch?v=" + str(entry["id"]),
+            }
+        )
+        if len(entries) >= max_entries:
+            break
+
+    if not playlist_id:
+        playlist_id = str(entries[0]["id"]) if entries else ""
+    if not entries:
+        raise DownloadError("لم يتم العثور على فيديوهات في قائمة التشغيل")
+
+    return {
+        "playlist_id": playlist_id,
+        "title": playlist_title,
+        "count": len(entries),
+        "entries": entries,
+    }

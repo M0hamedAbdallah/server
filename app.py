@@ -1,7 +1,9 @@
 """Minimal authenticated HTTP download endpoint for the Expo client."""
 
 import os
+import re
 import shutil
+from urllib.parse import parse_qs, urlparse
 
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
@@ -10,15 +12,20 @@ from config import (
     DOWNLOAD_TIMEOUT_SECONDS,
     HOST,
     MAX_FILE_SIZE_BYTES,
+    PLAYLIST_MAX_ENTRIES,
+    PLAYLIST_TIMEOUT_SECONDS,
     PORT,
     TOKEN,
 )
-from downloader import DownloadError, download
+from downloader import DownloadError, download, extract_playlist
 from validators import ValidationError, validate_input_url
 
 app = Flask(__name__)
 
 CHUNK_SIZE = 65536
+
+# معرّف قائمة تشغيل يوتيوب: أحرف وأرقام وشرطة وسفلية، بطول 10 أحرف على الأقل.
+PLAYLIST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 
 
 def _request_token():
@@ -93,6 +100,51 @@ def download_media():
     response.headers["Content-Disposition"] = disposition
     response.headers["Content-Length"] = str(result["size"])
     return response
+
+
+@app.get("/playlist")
+def playlist_media():
+    """إرجاع بيانات قائمة تشغيل يوتيوب العامة مرتبة (بدون تنزيل الفيديوهات).
+
+    يجيب بـ {"playlist_id", "title", "count", "entries"} حيث كل Entry =
+    {"id", "title", "url"}. سقف 50 عنصراً، ومهلة محددة، وبدون Shell
+    أو بيانات اعتماد أو محتوى خاص/محمي.
+    """
+    if _request_token() != TOKEN:
+        return jsonify({"error": "غير مصرح به"}), 401
+
+    url = request.args.get("url", "")
+    try:
+        valid_url = validate_input_url(url)
+    except ValidationError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    parsed = urlparse(valid_url)
+    host = (parsed.hostname or "").lower()
+    is_youtube = host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+    if not is_youtube:
+        return jsonify(
+            {"error": "هذه النقطة تدعم قوائم تشغيل يوتيوب العامة فقط"}
+        ), 400
+
+    playlist_id = (parse_qs(parsed.query).get("list") or [""])[0].strip()
+    if not playlist_id or not PLAYLIST_ID_RE.fullmatch(playlist_id):
+        return jsonify(
+            {
+                "error": "رابط قائمة تشغيل يوتيوب غير صالح أو مفقود معرف القائمة (list=). مثال: https://www.youtube.com/playlist?list=PL...."
+            }
+        ), 400
+
+    try:
+        result = extract_playlist(
+            valid_url,
+            timeout=PLAYLIST_TIMEOUT_SECONDS,
+            max_entries=PLAYLIST_MAX_ENTRIES,
+        )
+    except DownloadError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    return jsonify(result), 200
 
 
 @app.errorhandler(HTTPException)
